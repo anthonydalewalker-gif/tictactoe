@@ -50,6 +50,32 @@
   #linkOut { font-size:.85rem; }
   #codeOut { font-size:1.8rem; letter-spacing:6px; color:var(--x); font-weight:800; }
   @media (max-width:420px){ .modes button { padding:8px 12px; font-size:.9rem; } h1 { font-size:2.1rem; } }
+  /* Chat (online only) */
+  #chat { width:min(92vw,400px); margin-top:14px; background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:hidden; }
+  #chatHead { width:100%; display:flex; align-items:center; gap:8px; background:none; border:none; color:var(--text);
+              font:600 .95rem system-ui,-apple-system,Segoe UI,Roboto,sans-serif; padding:10px 14px; cursor:pointer; text-align:left; }
+  #chatHead .chev { margin-left:auto; color:var(--muted); transition:transform .2s; }
+  #chat.collapsed #chatHead .chev { transform:rotate(-90deg); }
+  #chat.collapsed #chatBody { display:none; }
+  #chat.unread { border-color:var(--x); box-shadow:0 0 0 2px rgba(56,189,248,.25); }
+  #chatBadge { background:var(--o); color:#0f172a; border-radius:999px; font-size:.75rem; font-weight:800; padding:1px 7px; }
+  #chatBody { border-top:1px solid var(--line); }
+  #chatLog { height:min(32vh,220px); overflow-y:auto; padding:10px; display:flex; flex-direction:column; gap:6px; overscroll-behavior:contain; }
+  .msg { max-width:78%; padding:7px 12px; border-radius:16px; font-size:.95rem; line-height:1.3; white-space:pre-wrap;
+         overflow-wrap:anywhere; color:#0f172a; }
+  .msg.mine { align-self:flex-end; border-bottom-right-radius:4px; }
+  .msg.theirs { align-self:flex-start; border-bottom-left-radius:4px; }
+  .msg.X { background:var(--x); } .msg.O { background:var(--o); }
+  .msg.big { font-size:1.6rem; background:transparent; padding:0 4px; }
+  .sys { align-self:center; color:var(--muted); font-size:.78rem; text-align:center; }
+  .reacts { display:flex; gap:6px; padding:0 10px 8px; }
+  .reacts button { flex:1; background:var(--bg); border:1px solid var(--line); border-radius:999px; color:var(--text);
+                   padding:5px 0; font-size:1rem; cursor:pointer; font-family:inherit; }
+  #chatForm { display:flex; gap:8px; padding:0 10px 10px; }
+  #chatIn { flex:1; min-width:0; background:var(--bg); color:var(--text); border:2px solid var(--line); border-radius:999px;
+            padding:8px 14px; font-size:16px; font-family:inherit; }
+  #chatIn:focus { outline:none; border-color:var(--x); }
+  #chat button:disabled, #chatIn:disabled { opacity:.5; cursor:default; }
   #toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#334155; color:var(--text);
            padding:10px 18px; border-radius:999px; font-size:.95rem; opacity:0; transition:opacity .25s; pointer-events:none; }
   #toast.show { opacity:1; }
@@ -96,6 +122,20 @@
     <span style="color:var(--o)"><span id="lo">O</span><b id="so">0</b></span>
   </div>
   <button id="reset" class="btn">New Game</button>
+  <section id="chat" hidden aria-label="Chat">
+    <button id="chatHead" type="button" aria-expanded="true">💬 Chat <span id="chatBadge" hidden>0</span><span class="chev">▾</span></button>
+    <div id="chatBody">
+      <div id="chatLog" aria-live="polite"></div>
+      <div class="reacts">
+        <button type="button" data-r="👍">👍</button><button type="button" data-r="😂">😂</button>
+        <button type="button" data-r="🔥">🔥</button><button type="button" data-r="GG">GG</button>
+      </div>
+      <form id="chatForm" autocomplete="off">
+        <input id="chatIn" maxlength="200" placeholder="Message…" enterkeyhint="send">
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </div>
+  </section>
   <div id="toast"></div>
 <script>
   const $=id=>document.getElementById(id);
@@ -118,6 +158,7 @@
     statusEl.textContent=statusText(w);
     $('reset').textContent = (mode==='online'&&over)?'Rematch':'New Game';
     $('reset').disabled = mode==='online' && !net.connected;
+    renderChatUI();
   }
   function statusText(w){
     if(mode==='online'){
@@ -249,8 +290,8 @@
       net.connected=true; net.stale=false; net.lastSeen=Date.now();
       const wasConnected=net.everConnected; net.everConnected=true;
       setNet('connected','Connected'); $('retry').hidden=true;
-      if(net.role==='host'){ $('share').hidden=true; sendState(); toast(wasConnected?'Opponent reconnected':'Opponent joined!'); }
-      else { send({t:'hello'}); toast(wasConnected?'Reconnected':'Joined! You are O'); }
+      if(net.role==='host'){ $('share').hidden=true; sendState(); toast(wasConnected?'Opponent reconnected':'Opponent joined!'); sysMsg(wasConnected?'Opponent reconnected':'Opponent joined'); }
+      else { send({t:'hello',have:chatLog.filter(m=>m.from!=='sys').length}); toast(wasConnected?'Reconnected':'Joined! You are O'); sysMsg(wasConnected?'Reconnected to host':'You joined as O'); }
       startHeartbeat(); render(); });
     c.on('data',m=>{ if(net.conn!==c)return; onData(m); });
     c.on('close',()=>{ if(net.conn===c) onConnLost(); });
@@ -265,7 +306,22 @@
     switch(m.t){
       case 'ping': send({t:'pong'}); break;
       case 'pong': break;
-      case 'hello': if(net.role==='host') sendState(); break;
+      case 'hello':
+        if(net.role!=='host')break;
+        sendState();
+        // a fresh guest tab (rejoin) gets the chat history back
+        if(m.have===0){ const hist=chatLog.filter(x=>x.from!=='sys').slice(-100); if(hist.length) send({t:'chatsync',log:hist}); }
+        break;
+      case 'chat': {
+        const text=String(m.text||'').slice(0,CHAT_MAX).trim();
+        if(text) addChat(net.me==='X'?'O':'X', text);
+        break; }
+      case 'chatsync':
+        if(net.role!=='guest'||!Array.isArray(m.log))break;
+        if(chatLog.some(x=>x.from!=='sys'))break;
+        m.log.forEach(x=>{ const t=String(x&&x.text||'').slice(0,CHAT_MAX).trim(); if(t&&(x.from==='X'||x.from==='O')) addChat(x.from,t,true); });
+        sysMsg('Chat history restored');
+        break;
       case 'state':
         if(net.role!=='guest')break;
         board=m.board.slice(); turn=m.turn; net.round=m.round; Object.assign(score,m.score); updScore(); render(); break;
@@ -278,7 +334,7 @@
         }
         move(i); break; }
       case 'new':
-        if(m.r>net.round){ const wasOver=over; net.round=m.r; reset(startingMark()); if(!wasOver) toast('Opponent started a new game'); }
+        if(m.r>net.round){ const wasOver=over; net.round=m.r; reset(startingMark()); if(!wasOver) toast('Opponent started a new game'); sysMsg('New game — '+startingMark()+' starts'); }
         break;
       case 'full': netFail('That game already has two players.'); break;
       case 'bye': onConnLost(); break;
@@ -286,7 +342,7 @@
   }
   function onlineNewGame(){
     if(!net.connected)return;
-    net.round++; send({t:'new',r:net.round}); reset(startingMark());
+    net.round++; send({t:'new',r:net.round}); reset(startingMark()); sysMsg('New game — '+startingMark()+' starts');
   }
   function startHeartbeat(){
     clearInterval(net.hb);
@@ -307,7 +363,7 @@
     } else {
       setNet('error','Disconnected from host'); $('retry').hidden=false;
     }
-    if(was) toast('Opponent disconnected');
+    if(was){ toast('Opponent disconnected'); sysMsg(net.role==='host'?'Opponent left':'Disconnected from host'); }
     render();
   }
   function netFail(msg, canRetry){
@@ -325,6 +381,7 @@
     const p=net.peer, c=net.conn;
     setTimeout(()=>{ try{c&&c.close();}catch(e){} try{p&&p.destroy();}catch(e){} },100);
     Object.assign(net,{peer:null,conn:null,role:null,me:null,code:null,round:0,connected:false,everConnected:false,stale:false});
+    clearChat();
     setLabels();
     if(backToLobby!==false){ showLobby(); setNet('','Offline'); }
     if(backToLobby!==false&&location.search) history.replaceState(null,'',location.pathname);
@@ -344,6 +401,51 @@
   };
   $('linkOut').onclick=e=>e.target.select();
   addEventListener('pagehide',()=>{ if(net.conn&&net.conn.open){ try{net.conn.send({t:'bye'});}catch(e){} } });
+
+  /* ---------------- Chat (rides the same PeerJS data connection) ---------------- */
+  const CHAT_MAX=200, chatEl=$('chat'), chatLogEl=$('chatLog'), chatIn=$('chatIn');
+  let chatLog=[], unread=0;
+  // start collapsed on small phones so the board stays in view
+  let chatOpen = !(innerWidth<480 && innerHeight<900);
+  function renderChatUI(){
+    const show = mode==='online' && net.everConnected;
+    chatEl.hidden=!show;
+    const can = show && net.connected;
+    chatIn.disabled=!can; chatEl.querySelectorAll('#chatForm button, .reacts button').forEach(b=>b.disabled=!can);
+    chatIn.placeholder = can ? 'Message…' : 'Disconnected';
+    chatEl.classList.toggle('collapsed',!chatOpen);
+    $('chatHead').setAttribute('aria-expanded',chatOpen);
+    $('chatBadge').hidden=!unread; $('chatBadge').textContent=unread>9?'9+':unread;
+    chatEl.classList.toggle('unread',unread>0);
+  }
+  function appendChatEl(m){
+    const d=document.createElement('div');
+    if(m.from==='sys'){ d.className='sys'; }
+    else {
+      const mine=m.from===net.me, big=/^(\p{Extended_Pictographic}|\uFE0F|\u200D){1,3}$/u.test(m.text);
+      d.className='msg '+m.from+(mine?' mine':' theirs')+(big?' big':'');
+      d.title=mine?'You':'Opponent';
+    }
+    d.textContent=m.text; // never parsed as HTML
+    chatLogEl.appendChild(d);
+    chatLogEl.scrollTop=chatLogEl.scrollHeight;
+  }
+  function addChat(from,text,quiet){
+    const m={from,text}; chatLog.push(m); if(chatLog.length>300){ chatLog.shift(); chatLogEl.firstChild&&chatLogEl.firstChild.remove(); }
+    appendChatEl(m);
+    if(!quiet&&from!=='sys'&&from!==net.me&&(!chatOpen||chatEl.hidden)){ unread++; toast('💬 '+(text.length>40?text.slice(0,40)+'…':text)); }
+    renderChatUI();
+  }
+  function sysMsg(text){ if(mode==='online') addChat('sys',text,true); }
+  function clearChat(){ chatLog=[]; unread=0; chatLogEl.textContent=''; chatIn.value=''; }
+  function sendChat(text){
+    text=String(text||'').slice(0,CHAT_MAX).trim();
+    if(!text||!net.connected)return false;
+    send({t:'chat',text}); addChat(net.me,text); return true;
+  }
+  $('chatForm').onsubmit=e=>{ e.preventDefault(); if(sendChat(chatIn.value)) chatIn.value=''; chatIn.focus(); };
+  chatEl.querySelectorAll('.reacts button').forEach(b=>b.onclick=()=>sendChat(b.dataset.r));
+  $('chatHead').onclick=()=>{ chatOpen=!chatOpen; if(chatOpen){ unread=0; requestAnimationFrame(()=>chatLogEl.scrollTop=chatLogEl.scrollHeight); } renderChatUI(); };
 
   reset();
   // Opening a shared link (?room=CODE) auto-joins as O

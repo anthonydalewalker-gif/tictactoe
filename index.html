@@ -37,7 +37,8 @@
   #online[hidden], [hidden] { display:none !important; }
   .pill { display:inline-flex; align-items:center; gap:8px; font-size:.85rem; color:var(--muted);
           background:var(--bg); border:1px solid var(--line); border-radius:999px; padding:4px 12px; }
-  .pill i { width:9px; height:9px; border-radius:50%; background:#64748b; display:inline-block; }
+  .pill { max-width:100%; } .pill span { text-align:center; }
+  .pill i { flex:none;  width:9px; height:9px; border-radius:50%; background:#64748b; display:inline-block; }
   .pill.connecting i, .pill.waiting i { background:#facc15; animation:pulse 1.2s infinite; }
   .pill.connected i { background:#22c55e; }
   .pill.error i { background:#ef4444; }
@@ -208,10 +209,37 @@
 
   /* ---------------- Online (PeerJS / WebRTC, no backend) ---------------- */
   const PEER_PREFIX='adttt-', CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  const PEER_OPTS={ debug:1, config:{ iceServers:[
-    {urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},
-    {urls:'stun:stun2.l.google.com:19302'},{urls:'stun:stun3.l.google.com:19302'},{urls:'stun:stun4.l.google.com:19302'} ]}};
-  const net={peer:null,conn:null,role:null,me:null,code:null,round:0,connected:false,everConnected:false,lastSeen:0,hb:null,joinTimer:null,stale:false};
+  // ICE servers. STUN finds a direct path; TURN relays traffic when direct fails (phones on mobile data,
+  // carrier-grade/symmetric NAT, strict Wi-Fi). Kept to 4 entries: more slows candidate gathering.
+  // freeTURN (freeturn.net): free, no signup, public creds free/free, dev/test grade (2 Mbit/s per peer, plenty here).
+  const BASE_ICE=[
+    {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'},
+    {urls:['turn:freeturn.net:3478','turn:freeturn.net:3478?transport=tcp'],username:'free',credential:'free'},
+    {urls:'turns:freeturn.net:5349',username:'free',credential:'free'} ];
+  // Optional, more reliable relay: paste a Metered/Open Relay credentials URL (free account) and it's fetched at runtime,
+  // e.g. 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY'
+  const METERED_TURN_URL='';
+  const CONNECT_TIMEOUT=15000;
+  const net={peer:null,conn:null,role:null,me:null,code:null,round:0,connected:false,everConnected:false,lastSeen:0,hb:null,joinTimer:null,brokerTimer:null,stale:false};
+  const log=(...a)=>console.log('[ttt]',...a);
+  let iceCache=null;
+  async function peerOpts(){
+    if(!iceCache){
+      let ice=BASE_ICE.slice();
+      try{ const o=JSON.parse(localStorage.getItem('ttt-ice')||'null'); if(Array.isArray(o)) ice=o; }catch(e){} // test/debug override
+      if(METERED_TURN_URL){
+        try{ const ctl=new AbortController(); const t=setTimeout(()=>ctl.abort(),4000);
+          const extra=await (await fetch(METERED_TURN_URL,{signal:ctl.signal})).json(); clearTimeout(t);
+          if(Array.isArray(extra)) ice=[...ice.slice(0,2),...extra.slice(0,3)];
+        }catch(e){ log('TURN credential fetch failed',e); }
+      }
+      iceCache=ice;
+    }
+    const config={iceServers:iceCache};
+    if(localStorage.getItem('ttt-relay')==='1') config.iceTransportPolicy='relay'; // debug: force TURN-only
+    return {debug:1, config};
+  }
   let peerLib=null;
 
   function loadPeerJS(){
@@ -234,9 +262,15 @@
     net.role='host'; net.me='X'; net.code=newCode(); net.round=0; setLabels();
     $('lobby').hidden=true; $('netActions').hidden=false; render();
     setNet('connecting','Connecting to matchmaking…');
+    startHostPeer(attempt);
+  }
+  async function startHostPeer(attempt=0, rebind=false){
     try{ await loadPeerJS(); }catch(e){ return netFail('Could not load the online library. Check your connection.'); }
-    const peer=new Peer(PEER_PREFIX+net.code.toLowerCase(), PEER_OPTS); net.peer=peer;
-    peer.on('open',()=>{ if(net.peer!==peer)return;
+    const opts=await peerOpts();
+    if(net.role!=='host')return;
+    const peer=new Peer(PEER_PREFIX+net.code.toLowerCase(), opts); net.peer=peer; peer._rebind=rebind;
+    armBrokerTimer(peer);
+    peer.on('open',()=>{ if(net.peer!==peer)return; clearTimeout(net.brokerTimer); log('broker: registered as',peer.id);
       $('codeOut').textContent=net.code; $('linkOut').value=roomLink(net.code); if(!net.connected) $('share').hidden=false;
       history.replaceState(null,'',location.pathname);
       if(!net.connected) setNet('waiting','Waiting for opponent…'); render(); });
@@ -244,6 +278,11 @@
       if(net.conn&&net.conn.open&&net.connected){ c.on('open',()=>{c.send({t:'full'});setTimeout(()=>c.close(),500);}); return; }
       attachConn(c); });
     peerCommon(peer, attempt);
+  }
+  function armBrokerTimer(peer){
+    clearTimeout(net.brokerTimer);
+    net.brokerTimer=setTimeout(()=>{ if(net.peer===peer&&!peer.open&&!net.connected)
+      netFail("Stage 1 failed: can't reach the matchmaking server (0.peerjs.com). Check your internet, then tap Retry.", true); },CONNECT_TIMEOUT);
   }
 
   async function joinGame(code){
@@ -254,39 +293,91 @@
     $('lobby').hidden=true; $('share').hidden=true; $('netActions').hidden=false; $('retry').hidden=true; render();
     setNet('connecting','Joining room '+code+'…');
     try{ await loadPeerJS(); }catch(e){ return netFail('Could not load the online library. Check your connection.'); }
-    const peer=new Peer(PEER_OPTS); net.peer=peer;
-    peer.on('open',()=>{ if(net.peer===peer&&!net.connected) connectToHost(); });
+    const opts=await peerOpts();
+    if(net.role!=='guest'||net.code!==code)return;
+    const peer=new Peer(opts); net.peer=peer; armBrokerTimer(peer);
+    setNet('connecting','Connecting to matchmaking server…');
+    peer.on('open',()=>{ if(net.peer!==peer)return; clearTimeout(net.brokerTimer); log('broker: registered as',peer.id); if(!net.connected) connectToHost(); });
     peerCommon(peer, 0);
   }
   function connectToHost(){
     if(!net.peer||net.peer.destroyed)return joinGame(net.code);
-    if(net.peer.disconnected){ net.peer.reconnect(); return; }
-    setNet('connecting','Joining room '+net.code+'…'); $('retry').hidden=true;
+    $('retry').hidden=true;
+    if(net.peer.disconnected){ setNet('connecting','Connecting to matchmaking server…'); armBrokerTimer(net.peer); net.peer.reconnect(); return; }
+    setNet('connecting','Connecting to host…');
+    log('stage 2: connecting to host',net.code);
     const c=net.peer.connect(PEER_PREFIX+net.code.toLowerCase(),{reliable:true}); attachConn(c);
     clearTimeout(net.joinTimer);
-    net.joinTimer=setTimeout(()=>{ if(!net.connected&&net.conn===c){ c.close(); netFail("Couldn't reach the host. Make sure they're still on the game page.", true); } },15000);
+    net.joinTimer=setTimeout(()=>{ if(!net.connected&&net.conn===c) peerStageFail(c); },CONNECT_TIMEOUT);
+  }
+  function peerStageFail(c){
+    const pc=c.peerConnection, answered=!!(pc&&pc.remoteDescription), ice=c._ice||(pc&&pc.iceConnectionState)||'new';
+    log('stage 2 failed. answered:',answered,'ice:',ice,'local candidate types:',[...(c._cand||[])].join(',')||'none');
+    clearTimeout(net.joinTimer);
+    if(net.conn===c){ net.conn=null; try{c.close();}catch(e){} }
+    if(!answered) netFail("Stage 2 failed: the host didn't answer. Their game page may be closed or asleep. Ask them to open it, then tap Retry.", true);
+    else netFail(`Stage 2 failed: found the host, but the connection between your networks was blocked (ICE: ${ice}). Tap Retry, or try with one phone on Wi-Fi.`, true);
+  }
+  // Watch the underlying RTCPeerConnection: log ICE progress and fail fast when ICE gives up.
+  function watchIce(c){
+    c._cand=new Set(); let tries=0;
+    const hook=()=>{
+      const pc=c.peerConnection;
+      if(!pc){ if(++tries<50) setTimeout(hook,100); return; }
+      pc.addEventListener('icecandidate',e=>{ if(e.candidate){ const t=(e.candidate.candidate.match(/ typ (\w+)/)||[])[1]; if(t) c._cand.add(t); } });
+      pc.addEventListener('icecandidateerror',e=>log('ICE candidate error',e.errorCode,e.errorText||'',e.url||''));
+      pc.addEventListener('icegatheringstatechange',()=>log('ICE gathering:',pc.iceGatheringState,'types:',[...c._cand].join(',')));
+      pc.addEventListener('iceconnectionstatechange',()=>{
+        const st=pc.iceConnectionState; c._ice=st; log('ICE connection state:',st);
+        if(net.conn!==c)return;
+        if(!net.connected&&net.role==='guest'&&(st==='checking')) setNet('connecting','Connecting to host… (finding a route)');
+        if(st==='failed'&&!net.connected){
+          if(net.role==='guest') peerStageFail(c);
+          else { log('incoming player connection failed (ICE failed)'); toast('A player tried to join but the connection failed'); net.conn=null; try{c.close();}catch(e){} }
+        }
+      });
+    };
+    hook();
+  }
+  // Which path did we end up on? (direct vs TURN relay) Shown in the status pill for diagnostics.
+  async function routeType(c){
+    try{ const pc=c.peerConnection; if(!pc)return '';
+      const st=await pc.getStats(); let pair=null; const byId={};
+      st.forEach(r=>{ byId[r.id]=r; });
+      st.forEach(r=>{ if(r.type==='transport'&&r.selectedCandidatePairId) pair=byId[r.selectedCandidatePairId]; });
+      if(!pair) st.forEach(r=>{ if(r.type==='candidate-pair'&&r.nominated&&r.state==='succeeded') pair=r; });
+      const l=pair&&byId[pair.localCandidateId], rm=pair&&byId[pair.remoteCandidateId];
+      if(!l)return '';
+      return (l.candidateType==='relay'||(rm&&rm.candidateType==='relay'))?'relay':'direct';
+    }catch(e){ return ''; }
   }
 
   function peerCommon(peer, attempt){
     peer.on('error',err=>{ if(net.peer!==peer)return; console.warn('peer error',err.type,err);
-      if(err.type==='unavailable-id'&&net.role==='host'&&attempt<4){ peer.destroy(); return createGame(attempt+1); }
+      if(err.type==='unavailable-id'&&net.role==='host'){
+        peer.destroy();
+        if(peer._rebind||net.everConnected){ if(attempt<6) return setTimeout(()=>{ if(net.role==='host'&&net.peer===peer) startHostPeer(attempt+1,true); },3000); }
+        else if(attempt<4) return createGame(attempt+1);
+      }
       if(err.type==='peer-unavailable') return netFail(net.everConnected?'The host left the game.':`Room ${net.code} not found. Check the code or ask for a new link.`, true);
       if(['network','server-error','socket-error','socket-closed'].includes(err.type)){
         if(net.connected) return; // game connection is direct; broker hiccups don't matter mid-game
-        return netFail("Can't reach the matchmaking server. Check your internet and try again.", true);
+        if(net.role==='host'&&peer.open!==false&&net.code&&$('lobby').hidden){ log('broker error while hosting; will re-register',err.type); return; }
+        return netFail("Stage 1 failed: can't reach the matchmaking server (0.peerjs.com). Check your internet, then tap Retry.", true);
       }
       if(err.type==='browser-incompatible') return netFail('This browser does not support online play (WebRTC).');
       netFail('Connection error: '+err.type, true);
     });
     // Keep registration with the broker alive (e.g. after a phone sleeps) so a dropped opponent can rejoin.
-    peer.on('disconnected',()=>{ if(net.peer===peer&&!peer.destroyed) setTimeout(()=>{ if(net.peer===peer&&!peer.destroyed&&peer.disconnected) peer.reconnect(); },1500); });
+    peer.on('disconnected',()=>{ log('broker: disconnected'); if(net.peer===peer&&!peer.destroyed) setTimeout(()=>{ if(net.peer===peer&&!peer.destroyed&&peer.disconnected) peer.reconnect(); },1500); });
   }
 
   function attachConn(c){
     if(net.conn&&net.conn!==c){ try{net.conn.close();}catch(e){} }
-    net.conn=c;
+    net.conn=c; watchIce(c);
     c.on('open',()=>{ if(net.conn!==c)return;
       clearTimeout(net.joinTimer);
+      routeType(c).then(t=>{ log('connected via',t||'unknown'); if(net.conn===c&&net.connected&&!net.stale&&t) setNet('connected','Connected · '+t); });
       net.connected=true; net.stale=false; net.lastSeen=Date.now();
       const wasConnected=net.everConnected; net.everConnected=true;
       setNet('connected','Connected'); $('retry').hidden=true;
@@ -367,16 +458,17 @@
     render();
   }
   function netFail(msg, canRetry){
-    clearTimeout(net.joinTimer);
+    clearTimeout(net.joinTimer); clearTimeout(net.brokerTimer); log('FAIL:',msg);
     net.connected=false; clearInterval(net.hb);
     setNet('error',msg);
     $('netActions').hidden=false;
-    $('retry').hidden=!(canRetry&&net.role==='guest');
-    if(net.role==='host'&&!net.everConnected&&!(net.peer&&net.peer.open)){ $('lobby').hidden=false; $('share').hidden=true; }
+    const hostFresh = net.role==='host' && !net.everConnected && !(net.peer&&(net.peer.open||net.peer._rebind));
+    $('retry').hidden=!(canRetry&&(net.role==='guest'||(net.role==='host'&&!hostFresh)));
+    if(hostFresh){ $('lobby').hidden=false; $('share').hidden=true; }
     render();
   }
   function leaveOnline(backToLobby){
-    clearTimeout(net.joinTimer); clearInterval(net.hb);
+    clearTimeout(net.joinTimer); clearTimeout(net.brokerTimer); clearInterval(net.hb);
     if(net.conn){ try{ if(net.conn.open) net.conn.send({t:'bye'}); }catch(e){} }
     const p=net.peer, c=net.conn;
     setTimeout(()=>{ try{c&&c.close();}catch(e){} try{p&&p.destroy();}catch(e){} },100);
@@ -390,7 +482,27 @@
   $('create').onclick=()=>createGame();
   $('joinForm').onsubmit=e=>{ e.preventDefault(); joinGame($('codeIn').value); };
   $('leave').onclick=()=>{ leaveOnline(true); score.X=score.O=score.D=0; updScore(); reset(); };
-  $('retry').onclick=()=>{ if(net.role==='guest') connectToHost(); };
+  $('retry').onclick=retryOnline;
+  function retryOnline(){
+    if(net.role==='guest'){ if(net.conn&&!net.connected){ try{net.conn.close();}catch(e){} net.conn=null; } connectToHost(); }
+    else if(net.role==='host'){ $('retry').hidden=true; wakeOnline(true); }
+  }
+  // Phones suspend background tabs: the host's broker link drops while they're sharing the link in another app.
+  // When the page comes back, re-register so the guest's join can get through.
+  function wakeOnline(force){
+    if(mode!=='online'||!net.role)return;
+    const p=net.peer;
+    if(net.role==='host'){
+      if(!p||p.destroyed){ log('wake: host peer gone, re-registering',net.code); setNet('connecting','Reconnecting to matchmaking…'); startHostPeer(0,true); }
+      else if(p.disconnected){ log('wake: host re-registering with broker'); setNet('connecting','Reconnecting to matchmaking…'); armBrokerTimer(p); p.reconnect(); }
+      else if(force&&!net.connected) setNet('waiting','Waiting for opponent…');
+    } else if(!net.connected){
+      if(!p||p.destroyed||p.disconnected||!$('retry').hidden||force) connectToHost();
+    } else if(p&&p.disconnected&&!p.destroyed){ p.reconnect(); }
+  }
+  document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') wakeOnline(); });
+  addEventListener('online',()=>wakeOnline());
+  addEventListener('pageshow',e=>{ if(e.persisted) wakeOnline(); });
   const canShare = !!navigator.share && matchMedia('(pointer:coarse)').matches;
   if(canShare) $('copy').textContent='Share Link';
   $('copy').onclick=async()=>{

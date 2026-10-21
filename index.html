@@ -175,7 +175,7 @@
   function play(i){
     if(over||board[i])return;
     if(mode==='cpu'&&turn==='O')return;
-    if(mode==='online'){ if(!net.connected||turn!==net.me)return; move(i); send({t:'move',i,r:net.round}); return; }
+    if(mode==='online'){ if(!net.connected||turn!==net.me)return; onlineMove(i); return; }
     move(i);
     if(mode==='cpu'&&!over)cpuTimer=setTimeout(cpu,350);
   }
@@ -207,201 +207,130 @@
   pvp.onclick=()=>setMode('pvp');pvc.onclick=()=>setMode('cpu');pon.onclick=()=>setMode('online');
   $('reset').onclick=()=>{ if(mode==='online') onlineNewGame(); else reset(); };
 
-  /* ---------------- Online (PeerJS / WebRTC, no backend) ---------------- */
-  const PEER_PREFIX='adttt-', CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-  // ICE servers. STUN finds a direct path; TURN relays traffic when direct fails (phones on mobile data,
-  // carrier-grade/symmetric NAT, strict Wi-Fi). Kept to 4 entries: more slows candidate gathering.
-  // freeTURN (freeturn.net): free, no signup, public creds free/free, dev/test grade (2 Mbit/s per peer, plenty here).
-  const BASE_ICE=[
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun1.l.google.com:19302'},
-    {urls:['turn:freeturn.net:3478','turn:freeturn.net:3478?transport=tcp'],username:'free',credential:'free'},
-    {urls:'turns:freeturn.net:5349',username:'free',credential:'free'} ];
-  // Optional, more reliable relay: paste a Metered/Open Relay credentials URL (free account) and it's fetched at runtime,
-  // e.g. 'https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=YOUR_API_KEY'
-  const METERED_TURN_URL='';
-  const CONNECT_TIMEOUT=15000;
-  const net={peer:null,conn:null,role:null,me:null,code:null,round:0,connected:false,everConnected:false,lastSeen:0,hb:null,joinTimer:null,brokerTimer:null,stale:false};
+  /* ---------------- Online (Supabase Realtime: broadcast + presence) ---------------- */
+  // One channel per room: "ttt:<CODE>". Presence tells us who is in the room; broadcast carries moves/chat.
+  // The host (X) is authoritative: it validates every move and broadcasts the full state with a sequence number.
+  const SUPABASE_URL='https://vrfwzpykuisesbbukxrp.supabase.co';
+  const SUPABASE_KEY='sb_publishable_dYQXdCoN8d_zXe3UeMRPDQ_s0ko2Q4C';
+  const CODE_CHARS='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  const CONNECT_TIMEOUT=12000;
+  const net={ch:null,role:null,me:null,code:null,round:0,seq:0,connected:false,everConnected:false,
+    id:null,peerId:null,joinTimer:null,retryTimer:null,full:false,welcomed:false};
   const log=(...a)=>console.log('[ttt]',...a);
-  let iceCache=null;
-  async function peerOpts(){
-    if(!iceCache){
-      let ice=BASE_ICE.slice();
-      try{ const o=JSON.parse(localStorage.getItem('ttt-ice')||'null'); if(Array.isArray(o)) ice=o; }catch(e){} // test/debug override
-      if(METERED_TURN_URL){
-        try{ const ctl=new AbortController(); const t=setTimeout(()=>ctl.abort(),4000);
-          const extra=await (await fetch(METERED_TURN_URL,{signal:ctl.signal})).json(); clearTimeout(t);
-          if(Array.isArray(extra)) ice=[...ice.slice(0,2),...extra.slice(0,3)];
-        }catch(e){ log('TURN credential fetch failed',e); }
-      }
-      iceCache=ice;
-    }
-    const config={iceServers:iceCache};
-    if(localStorage.getItem('ttt-relay')==='1') config.iceTransportPolicy='relay'; // debug: force TURN-only
-    return {debug:1, config};
-  }
-  let peerLib=null;
-
-  function loadPeerJS(){
-    if(window.Peer) return Promise.resolve();
-    if(peerLib) return peerLib;
-    peerLib=new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
-      s.onload=()=>res();s.onerror=()=>{peerLib=null;rej(new Error('PeerJS failed to load'));};document.head.appendChild(s);});
-    return peerLib;
+  let sb=null, sbLib=null;
+  function loadSupabase(){
+    if(sb) return Promise.resolve(sb);
+    if(!sbLib) sbLib=new Promise((res,rej)=>{
+      if(window.supabase) return res();
+      const s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js';
+      s.onload=()=>res(); s.onerror=()=>{sbLib=null;rej(new Error('load failed'));}; document.head.appendChild(s);
+    }).then(()=>{ sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY,{auth:{persistSession:false,autoRefreshToken:false},realtime:{params:{eventsPerSecond:20}}}); return sb; });
+    return sbLib;
   }
   function setNet(state,text){ const p=$('netStatus'); p.className='pill '+state; p.querySelector('span').textContent=text; }
   function toast(msg){ const t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2200); }
   function newCode(){ let c=''; const a=new Uint32Array(5); crypto.getRandomValues(a); a.forEach(n=>c+=CODE_CHARS[n%CODE_CHARS.length]); return c; }
+  function newId(){ return Math.random().toString(36).slice(2,10)+Date.now().toString(36); }
   function roomLink(code){ return location.origin+location.pathname+'?room='+code; }
-  function send(m){ if(net.conn&&net.conn.open){ try{net.conn.send(m);}catch(e){console.warn(e);} } }
+  function send(m){ if(net.ch&&net.ch.state==='joined'){ m.from=net.id; net.ch.send({type:'broadcast',event:'msg',payload:m}).catch(e=>console.warn(e)); } }
   function showLobby(){ $('lobby').hidden=false; $('share').hidden=true; $('netActions').hidden=true; $('retry').hidden=true; }
   function startingMark(){ return net.round%2===0 ? 'X' : 'O'; } // alternate who starts each rematch
 
-  async function createGame(attempt=0){
+  async function createGame(){
     leaveOnline(false);
-    net.role='host'; net.me='X'; net.code=newCode(); net.round=0; setLabels();
-    $('lobby').hidden=true; $('netActions').hidden=false; render();
-    setNet('connecting','Connecting to matchmaking…');
-    startHostPeer(attempt);
+    Object.assign(net,{role:'host',me:'X',code:newCode(),id:newId(),round:0,seq:0});
+    setLabels(); reset('X');
+    $('lobby').hidden=true; $('netActions').hidden=false; $('retry').hidden=true;
+    setNet('connecting','Creating room…');
+    openChannel();
   }
-  async function startHostPeer(attempt=0, rebind=false){
-    try{ await loadPeerJS(); }catch(e){ return netFail('Could not load the online library. Check your connection.'); }
-    const opts=await peerOpts();
-    if(net.role!=='host')return;
-    const peer=new Peer(PEER_PREFIX+net.code.toLowerCase(), opts); net.peer=peer; peer._rebind=rebind;
-    armBrokerTimer(peer);
-    peer.on('open',()=>{ if(net.peer!==peer)return; clearTimeout(net.brokerTimer); log('broker: registered as',peer.id);
-      $('codeOut').textContent=net.code; $('linkOut').value=roomLink(net.code); if(!net.connected) $('share').hidden=false;
-      history.replaceState(null,'',location.pathname);
-      if(!net.connected) setNet('waiting','Waiting for opponent…'); render(); });
-    peer.on('connection',c=>{ if(net.peer!==peer)return;
-      if(net.conn&&net.conn.open&&net.connected){ c.on('open',()=>{c.send({t:'full'});setTimeout(()=>c.close(),500);}); return; }
-      attachConn(c); });
-    peerCommon(peer, attempt);
-  }
-  function armBrokerTimer(peer){
-    clearTimeout(net.brokerTimer);
-    net.brokerTimer=setTimeout(()=>{ if(net.peer===peer&&!peer.open&&!net.connected)
-      netFail("Stage 1 failed: can't reach the matchmaking server (0.peerjs.com). Check your internet, then tap Retry.", true); },CONNECT_TIMEOUT);
-  }
-
   async function joinGame(code){
-    code=(code||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+    code=String(code||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
     if(code.length<4){ toast('Enter the room code'); return; }
     leaveOnline(false);
-    net.role='guest'; net.me='O'; net.code=code; setLabels();
-    $('lobby').hidden=true; $('share').hidden=true; $('netActions').hidden=false; $('retry').hidden=true; render();
+    // keep the same id per room in this tab so a reload/rejoin is recognised as the same guest
+    let id=sessionStorage.getItem('ttt-id-'+code); if(!id){ id=newId(); sessionStorage.setItem('ttt-id-'+code,id); }
+    Object.assign(net,{role:'guest',me:'O',code,id,round:0,seq:0});
+    setLabels(); reset('X');
+    $('lobby').hidden=true; $('netActions').hidden=false; $('retry').hidden=true;
     setNet('connecting','Joining room '+code+'…');
-    try{ await loadPeerJS(); }catch(e){ return netFail('Could not load the online library. Check your connection.'); }
-    const opts=await peerOpts();
-    if(net.role!=='guest'||net.code!==code)return;
-    const peer=new Peer(opts); net.peer=peer; armBrokerTimer(peer);
-    setNet('connecting','Connecting to matchmaking server…');
-    peer.on('open',()=>{ if(net.peer!==peer)return; clearTimeout(net.brokerTimer); log('broker: registered as',peer.id); if(!net.connected) connectToHost(); });
-    peerCommon(peer, 0);
+    openChannel();
   }
-  function connectToHost(){
-    if(!net.peer||net.peer.destroyed)return joinGame(net.code);
-    $('retry').hidden=true;
-    if(net.peer.disconnected){ setNet('connecting','Connecting to matchmaking server…'); armBrokerTimer(net.peer); net.peer.reconnect(); return; }
-    setNet('connecting','Connecting to host…');
-    log('stage 2: connecting to host',net.code);
-    const c=net.peer.connect(PEER_PREFIX+net.code.toLowerCase(),{reliable:true}); attachConn(c);
-    clearTimeout(net.joinTimer);
-    net.joinTimer=setTimeout(()=>{ if(!net.connected&&net.conn===c) peerStageFail(c); },CONNECT_TIMEOUT);
-  }
-  function peerStageFail(c){
-    const pc=c.peerConnection, answered=!!(pc&&pc.remoteDescription), ice=c._ice||(pc&&pc.iceConnectionState)||'new';
-    log('stage 2 failed. answered:',answered,'ice:',ice,'local candidate types:',[...(c._cand||[])].join(',')||'none');
-    clearTimeout(net.joinTimer);
-    if(net.conn===c){ net.conn=null; try{c.close();}catch(e){} }
-    if(!answered) netFail("Stage 2 failed: the host didn't answer. Their game page may be closed or asleep. Ask them to open it, then tap Retry.", true);
-    else netFail(`Stage 2 failed: found the host, but the connection between your networks was blocked (ICE: ${ice}). Tap Retry, or try with one phone on Wi-Fi.`, true);
-  }
-  // Watch the underlying RTCPeerConnection: log ICE progress and fail fast when ICE gives up.
-  function watchIce(c){
-    c._cand=new Set(); let tries=0;
-    const hook=()=>{
-      const pc=c.peerConnection;
-      if(!pc){ if(++tries<50) setTimeout(hook,100); return; }
-      pc.addEventListener('icecandidate',e=>{ if(e.candidate){ const t=(e.candidate.candidate.match(/ typ (\w+)/)||[])[1]; if(t) c._cand.add(t); } });
-      pc.addEventListener('icecandidateerror',e=>log('ICE candidate error',e.errorCode,e.errorText||'',e.url||''));
-      pc.addEventListener('icegatheringstatechange',()=>log('ICE gathering:',pc.iceGatheringState,'types:',[...c._cand].join(',')));
-      pc.addEventListener('iceconnectionstatechange',()=>{
-        const st=pc.iceConnectionState; c._ice=st; log('ICE connection state:',st);
-        if(net.conn!==c)return;
-        if(!net.connected&&net.role==='guest'&&(st==='checking')) setNet('connecting','Connecting to host… (finding a route)');
-        if(st==='failed'&&!net.connected){
-          if(net.role==='guest') peerStageFail(c);
-          else { log('incoming player connection failed (ICE failed)'); toast('A player tried to join but the connection failed'); net.conn=null; try{c.close();}catch(e){} }
+  async function openChannel(){
+    try{ await loadSupabase(); }catch(e){ return netFail('Could not load the online library. Check your connection.', true); }
+    if(!net.role)return;
+    net.welcomed=false;
+    if(net.ch){ const old=net.ch; net.ch=null; try{ sb.removeChannel(old); }catch(e){} }
+    const ch=sb.channel('ttt:'+net.code,{config:{broadcast:{self:false,ack:false},presence:{key:net.id}}});
+    net.ch=ch;
+    ch.on('broadcast',{event:'msg'},({payload})=>{ if(net.ch===ch) onData(payload); });
+    ch.on('presence',{event:'sync'},()=>{ if(net.ch===ch) onPresence(); });
+    ch.subscribe(async(status)=>{
+      if(net.ch!==ch)return; log('channel',status);
+      if(status==='SUBSCRIBED'){
+        clearTimeout(net.retryTimer);
+        await ch.track({role:net.role,at:Date.now()});
+        if(net.role==='host'){
+          $('codeOut').textContent=net.code; $('linkOut').value=roomLink(net.code);
+          if(!net.connected){ $('share').hidden=false; setNet('waiting','Waiting for opponent…'); }
+        } else if(!net.connected){
+          setNet('connecting','Looking for host…');
+          clearTimeout(net.joinTimer);
+          net.joinTimer=setTimeout(()=>{ if(net.ch===ch&&!net.connected&&!net.full)
+            netFail(net.everConnected?'The host left the game.':`Room ${net.code} not found. Check the code or ask for a new link.`, true); },CONNECT_TIMEOUT);
         }
-      });
-    };
-    hook();
-  }
-  // Which path did we end up on? (direct vs TURN relay) Shown in the status pill for diagnostics.
-  async function routeType(c){
-    try{ const pc=c.peerConnection; if(!pc)return '';
-      const st=await pc.getStats(); let pair=null; const byId={};
-      st.forEach(r=>{ byId[r.id]=r; });
-      st.forEach(r=>{ if(r.type==='transport'&&r.selectedCandidatePairId) pair=byId[r.selectedCandidatePairId]; });
-      if(!pair) st.forEach(r=>{ if(r.type==='candidate-pair'&&r.nominated&&r.state==='succeeded') pair=r; });
-      const l=pair&&byId[pair.localCandidateId], rm=pair&&byId[pair.remoteCandidateId];
-      if(!l)return '';
-      return (l.candidateType==='relay'||(rm&&rm.candidateType==='relay'))?'relay':'direct';
-    }catch(e){ return ''; }
-  }
-
-  function peerCommon(peer, attempt){
-    peer.on('error',err=>{ if(net.peer!==peer)return; console.warn('peer error',err.type,err);
-      if(err.type==='unavailable-id'&&net.role==='host'){
-        peer.destroy();
-        if(peer._rebind||net.everConnected){ if(attempt<6) return setTimeout(()=>{ if(net.role==='host'&&net.peer===peer) startHostPeer(attempt+1,true); },3000); }
-        else if(attempt<4) return createGame(attempt+1);
+      } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+        if(status==='CLOSED'&&!net.role)return;
+        setNet('connecting','Reconnecting…');
+        clearTimeout(net.retryTimer);
+        net.retryTimer=setTimeout(()=>{ if(net.ch===ch&&net.role) openChannel(); },2000);
       }
-      if(err.type==='peer-unavailable') return netFail(net.everConnected?'The host left the game.':`Room ${net.code} not found. Check the code or ask for a new link.`, true);
-      if(['network','server-error','socket-error','socket-closed'].includes(err.type)){
-        if(net.connected) return; // game connection is direct; broker hiccups don't matter mid-game
-        if(net.role==='host'&&peer.open!==false&&net.code&&$('lobby').hidden){ log('broker error while hosting; will re-register',err.type); return; }
-        return netFail("Stage 1 failed: can't reach the matchmaking server (0.peerjs.com). Check your internet, then tap Retry.", true);
-      }
-      if(err.type==='browser-incompatible') return netFail('This browser does not support online play (WebRTC).');
-      netFail('Connection error: '+err.type, true);
     });
-    // Keep registration with the broker alive (e.g. after a phone sleeps) so a dropped opponent can rejoin.
-    peer.on('disconnected',()=>{ log('broker: disconnected'); if(net.peer===peer&&!peer.destroyed) setTimeout(()=>{ if(net.peer===peer&&!peer.destroyed&&peer.disconnected) peer.reconnect(); },1500); });
   }
-
-  function attachConn(c){
-    if(net.conn&&net.conn!==c){ try{net.conn.close();}catch(e){} }
-    net.conn=c; watchIce(c);
-    c.on('open',()=>{ if(net.conn!==c)return;
+  // Who's in the room? Decide connected / opponent left / room full.
+  function onPresence(){
+    const st=net.ch.presenceState(); // { key: [ {role,at,...} ] }
+    const people=Object.entries(st).map(([k,v])=>({id:k,role:v[0]&&v[0].role,at:(v[0]&&v[0].at)||0}));
+    const hosts=people.filter(p=>p.role==='host'), guests=people.filter(p=>p.role==='guest').sort((a,b)=>a.at-b.at||(a.id<b.id?-1:1));
+    let opp=null;
+    if(net.role==='host'){
+      if(net.peerId&&guests.some(g=>g.id===net.peerId)) opp=net.peerId;
+      else if(guests.length) opp=guests[0].id;
+      // tell any extra guest the room is full
+      guests.forEach(g=>{ if(g.id!==opp) send({t:'full',to:g.id}); });
+      if(opp&&opp!==net.peerId){ net.peerId=opp; }
+    } else {
+      // guest: the host must be present AND have accepted us (sent us state) before we count as connected
+      if(hosts.length){ if(net.welcomed) opp=hosts[0].id; else send({t:'hello',have:chatLog.filter(m=>m.from!=='sys').length}); }
+      else net.welcomed=false;
+    }
+    const nowConnected=!!opp && !net.full;
+    if(nowConnected&&!net.connected){
       clearTimeout(net.joinTimer);
-      routeType(c).then(t=>{ log('connected via',t||'unknown'); if(net.conn===c&&net.connected&&!net.stale&&t) setNet('connected','Connected · '+t); });
-      net.connected=true; net.stale=false; net.lastSeen=Date.now();
-      const wasConnected=net.everConnected; net.everConnected=true;
+      net.connected=true; const was=net.everConnected; net.everConnected=true;
       setNet('connected','Connected'); $('retry').hidden=true;
-      if(net.role==='host'){ $('share').hidden=true; sendState(); toast(wasConnected?'Opponent reconnected':'Opponent joined!'); sysMsg(wasConnected?'Opponent reconnected':'Opponent joined'); }
-      else { send({t:'hello',have:chatLog.filter(m=>m.from!=='sys').length}); toast(wasConnected?'Reconnected':'Joined! You are O'); sysMsg(wasConnected?'Reconnected to host':'You joined as O'); }
-      startHeartbeat(); render(); });
-    c.on('data',m=>{ if(net.conn!==c)return; onData(m); });
-    c.on('close',()=>{ if(net.conn===c) onConnLost(); });
-    c.on('error',e=>{ console.warn('conn error',e); if(net.conn===c&&!c.open) onConnLost(); });
+      if(net.role==='host'){ $('share').hidden=true; sendState(); toast(was?'Opponent reconnected':'Opponent joined!'); sysMsg(was?'Opponent reconnected':'Opponent joined'); }
+      else { toast(was?'Reconnected':'Joined! You are O'); sysMsg(was?'Reconnected to host':'You joined as O'); }
+      render();
+    } else if(!nowConnected&&net.connected){
+      onConnLost();
+    }
   }
-
-  function sendState(){ send({t:'state',board,turn,score:{...score},round:net.round}); }
+  function sendState(to){ send({t:'state',to:to||net.peerId,board,turn,score:{...score},round:net.round,seq:net.seq}); }
+  function applyState(m){
+    if(typeof m.seq!=='number'||m.seq<net.seq)return; // stale
+    board=m.board.slice(); turn=m.turn; net.round=m.round; net.seq=m.seq; Object.assign(score,m.score); updScore(); render();
+  }
   function onData(m){
-    net.lastSeen=Date.now();
-    if(net.stale){ net.stale=false; setNet('connected','Connected'); }
     if(!m||typeof m!=='object')return;
+    if(m.to&&m.to!==net.id)return;                         // addressed to someone else
+    if(m.t==='full'){ if(net.role==='guest'&&!net.welcomed){ net.full=true; netFail('That game already has two players.'); } return; }
+    if(net.role==='host'&&net.peerId&&m.from!==net.peerId)return; // ignore anyone but the accepted guest
     switch(m.t){
-      case 'ping': send({t:'pong'}); break;
-      case 'pong': break;
       case 'hello':
         if(net.role!=='host')break;
         sendState();
-        // a fresh guest tab (rejoin) gets the chat history back
-        if(m.have===0){ const hist=chatLog.filter(x=>x.from!=='sys').slice(-100); if(hist.length) send({t:'chatsync',log:hist}); }
+        if(m.have===0){ const hist=chatLog.filter(x=>x.from!=='sys').slice(-100); if(hist.length) send({t:'chatsync',to:net.peerId,log:hist}); }
         break;
       case 'chat': {
         const text=String(m.text||'').slice(0,CHAT_MAX).trim();
@@ -415,64 +344,59 @@
         break;
       case 'state':
         if(net.role!=='guest')break;
-        board=m.board.slice(); turn=m.turn; net.round=m.round; Object.assign(score,m.score); updScore(); render(); break;
-      case 'move': {
-        const i=m.i;
-        if(m.r!==net.round || over || turn===net.me || !(i>=0&&i<9) || board[i]){
-          // out of sync: host is the source of truth
-          if(net.role==='host') sendState(); else send({t:'hello'});
-          break;
-        }
-        move(i); break; }
-      case 'new':
-        if(m.r>net.round){ const wasOver=over; net.round=m.r; reset(startingMark()); if(!wasOver) toast('Opponent started a new game'); sysMsg('New game — '+startingMark()+' starts'); }
+        if(!net.welcomed){ net.welcomed=true; applyState(m); onPresence(); break; }
+        { const prevRound=net.round; applyState(m); if(net.round>prevRound&&m.board.every(v=>!v)) sysMsg('New game — '+turn+' starts'); }
         break;
-      case 'full': netFail('That game already has two players.'); break;
-      case 'bye': onConnLost(); break;
+      case 'move': { // guest -> host
+        if(net.role!=='host')break;
+        const i=m.i;
+        if(m.r!==net.round||m.seq!==net.seq||over||turn!=='O'||!(i>=0&&i<9)||board[i]){ sendState(); break; } // out of sync: resync
+        net.seq++; move(i); sendState(); break; }
+      case 'new': // guest asks for a rematch
+        if(net.role!=='host')break;
+        if(m.r===net.round){ const wasOver=over; hostNewRound(); if(!wasOver) toast('Opponent started a new game'); }
+        else sendState();
+        break;
+      case 'bye': if(net.connected) onConnLost(); break;
     }
+  }
+  function hostNewRound(){ net.round++; net.seq++; reset(startingMark()); sendState(); sysMsg('New game — '+startingMark()+' starts'); }
+  // called from play() for online moves
+  function onlineMove(i){
+    if(net.role==='host'){ net.seq++; move(i); sendState(); }
+    else { send({t:'move',i,r:net.round,seq:net.seq}); move(i); } // optimistic; host state confirms
   }
   function onlineNewGame(){
     if(!net.connected)return;
-    net.round++; send({t:'new',r:net.round}); reset(startingMark()); sysMsg('New game — '+startingMark()+' starts');
-  }
-  function startHeartbeat(){
-    clearInterval(net.hb);
-    net.hb=setInterval(()=>{
-      if(!net.connected)return;
-      send({t:'ping'});
-      if(!net.stale&&Date.now()-net.lastSeen>10000){ net.stale=true; setNet('waiting','Opponent not responding…'); }
-    },2500);
+    if(net.role==='host') hostNewRound(); else send({t:'new',r:net.round});
   }
   function onConnLost(){
-    if(!net.connected){ net.conn=null; return; } // never opened: the failure path already set a message
-    const was=net.connected; net.connected=false; net.stale=false; clearInterval(net.hb);
-    try{ net.conn&&net.conn.close(); }catch(e){}
-    net.conn=null;
+    net.connected=false;
     if(net.role==='host'){
+      net.peerId=null;
       setNet('error','Opponent disconnected — they can rejoin with the link');
       if(net.code){ $('share').hidden=false; }
     } else {
-      setNet('error','Disconnected from host'); $('retry').hidden=false;
+      setNet('error','Host disconnected — waiting for them to come back…'); $('retry').hidden=false;
     }
-    if(was){ toast('Opponent disconnected'); sysMsg(net.role==='host'?'Opponent left':'Disconnected from host'); }
+    toast('Opponent disconnected'); sysMsg(net.role==='host'?'Opponent left':'Disconnected from host');
     render();
   }
   function netFail(msg, canRetry){
-    clearTimeout(net.joinTimer); clearTimeout(net.brokerTimer); log('FAIL:',msg);
-    net.connected=false; clearInterval(net.hb);
+    clearTimeout(net.joinTimer); log('FAIL:',msg);
+    net.connected=false;
     setNet('error',msg);
     $('netActions').hidden=false;
-    const hostFresh = net.role==='host' && !net.everConnected && !(net.peer&&(net.peer.open||net.peer._rebind));
-    $('retry').hidden=!(canRetry&&(net.role==='guest'||(net.role==='host'&&!hostFresh)));
-    if(hostFresh){ $('lobby').hidden=false; $('share').hidden=true; }
+    $('retry').hidden=!canRetry;
+    if(net.full||(net.role==='guest'&&!net.everConnected&&!canRetry)){ const ch=net.ch; net.ch=null; try{ ch&&sb.removeChannel(ch); }catch(e){} }
     render();
   }
   function leaveOnline(backToLobby){
-    clearTimeout(net.joinTimer); clearTimeout(net.brokerTimer); clearInterval(net.hb);
-    if(net.conn){ try{ if(net.conn.open) net.conn.send({t:'bye'}); }catch(e){} }
-    const p=net.peer, c=net.conn;
-    setTimeout(()=>{ try{c&&c.close();}catch(e){} try{p&&p.destroy();}catch(e){} },100);
-    Object.assign(net,{peer:null,conn:null,role:null,me:null,code:null,round:0,connected:false,everConnected:false,stale:false});
+    clearTimeout(net.joinTimer); clearTimeout(net.retryTimer);
+    const ch=net.ch;
+    if(ch){ try{ if(ch.state==='joined') ch.send({type:'broadcast',event:'msg',payload:{t:'bye',from:net.id}}); }catch(e){} net.ch=null;
+      setTimeout(()=>{ try{ ch.untrack(); sb.removeChannel(ch); }catch(e){} },150); }
+    Object.assign(net,{role:null,me:null,code:null,round:0,seq:0,connected:false,everConnected:false,id:null,peerId:null,full:false,welcomed:false});
     clearChat();
     setLabels();
     if(backToLobby!==false){ showLobby(); setNet('','Offline'); }
@@ -482,23 +406,14 @@
   $('create').onclick=()=>createGame();
   $('joinForm').onsubmit=e=>{ e.preventDefault(); joinGame($('codeIn').value); };
   $('leave').onclick=()=>{ leaveOnline(true); score.X=score.O=score.D=0; updScore(); reset(); };
-  $('retry').onclick=retryOnline;
-  function retryOnline(){
-    if(net.role==='guest'){ if(net.conn&&!net.connected){ try{net.conn.close();}catch(e){} net.conn=null; } connectToHost(); }
-    else if(net.role==='host'){ $('retry').hidden=true; wakeOnline(true); }
-  }
-  // Phones suspend background tabs: the host's broker link drops while they're sharing the link in another app.
-  // When the page comes back, re-register so the guest's join can get through.
-  function wakeOnline(force){
-    if(mode!=='online'||!net.role)return;
-    const p=net.peer;
-    if(net.role==='host'){
-      if(!p||p.destroyed){ log('wake: host peer gone, re-registering',net.code); setNet('connecting','Reconnecting to matchmaking…'); startHostPeer(0,true); }
-      else if(p.disconnected){ log('wake: host re-registering with broker'); setNet('connecting','Reconnecting to matchmaking…'); armBrokerTimer(p); p.reconnect(); }
-      else if(force&&!net.connected) setNet('waiting','Waiting for opponent…');
-    } else if(!net.connected){
-      if(!p||p.destroyed||p.disconnected||!$('retry').hidden||force) connectToHost();
-    } else if(p&&p.disconnected&&!p.destroyed){ p.reconnect(); }
+  $('retry').onclick=()=>{ $('retry').hidden=true; net.full=false; setNet('connecting','Reconnecting…'); openChannel(); };
+  // Phones suspend background tabs and the socket drops. When the page comes back, rejoin the channel
+  // (presence re-announces us; the guest's hello pulls the current state from the host).
+  function wakeOnline(){
+    if(mode!=='online'||!net.role||net.full)return;
+    const ch=net.ch;
+    if(!ch||ch.state!=='joined'||(sb&&!sb.realtime.isConnected())){ log('wake: rejoining channel'); setNet('connecting','Reconnecting…'); openChannel(); }
+    else if(net.role==='guest'&&net.connected) send({t:'hello',have:chatLog.filter(m=>m.from!=='sys').length});
   }
   document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') wakeOnline(); });
   addEventListener('online',()=>wakeOnline());
@@ -512,9 +427,9 @@
     $('copy').textContent='Copied!'; setTimeout(()=>$('copy').textContent=canShare?'Share Link':'Copy Link',1500); toast('Link copied');
   };
   $('linkOut').onclick=e=>e.target.select();
-  addEventListener('pagehide',()=>{ if(net.conn&&net.conn.open){ try{net.conn.send({t:'bye'});}catch(e){} } });
+  addEventListener('pagehide',e=>{ if(!e.persisted&&net.ch&&net.ch.state==='joined'){ try{ send({t:'bye'}); }catch(_){} } });
 
-  /* ---------------- Chat (rides the same PeerJS data connection) ---------------- */
+  /* ---------------- Chat (rides the same Realtime channel) ---------------- */
   const CHAT_MAX=200, chatEl=$('chat'), chatLogEl=$('chatLog'), chatIn=$('chatIn');
   let chatLog=[], unread=0;
   // start collapsed on small phones so the board stays in view
